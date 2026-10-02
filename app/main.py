@@ -15,12 +15,15 @@ from starlette.convertors import Convertor, register_url_convertor
 from app.arbitration import ArbitrationError, apply_arbitration, build_groups
 from app.copies import (
     AnnotationNotFound,
+    CopyFinalizedError,
     CopyNotFound,
     CopyStore,
     CopyValidationError,
     GroupHeldError,
+    HoldersExistError,
     ModifyConflictError,
     NotHeldError,
+    RevisionConflictError,
 )
 from app.migration import DecisionError, apply_decisions, migrate_annotations
 from app.nesting import NestingError, audit_nesting, export_nesting, validate_rules
@@ -231,6 +234,11 @@ class CopyModifyIn(BaseModel):
     start: StrictInt
     end: StrictInt
     label: NonEmptyStr
+
+
+class CopyFinalizeIn(BaseModel):
+    # 结稿乐观锁版本：正整数；布尔不是合法整数（BeforeValidator 先行拒绝）
+    expected_revision: StrictInt = Field(ge=1)
 
 
 @app.get("/")
@@ -466,19 +474,24 @@ def get_store() -> CopyStore:
 
 
 def _copy_snapshot(action):
-    """统一映射工作副本错误：422 非法输入 / 409 持有冲突 / 404 资源不存在。"""
+    """统一映射工作副本错误：422 非法输入 / 409 冲突 / 404 资源不存在。"""
     try:
         return action()
     except CopyValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    except (GroupHeldError, NotHeldError, ModifyConflictError) as exc:
-        raise HTTPException(status_code=409, detail={
-            "message": str(exc),
-            **({"holder": exc.holder, "group": exc.group}
-               if isinstance(exc, GroupHeldError) else {}),
-            **({"foreign": exc.foreign} if isinstance(exc, ModifyConflictError)
-               else {}),
-        })
+    except (GroupHeldError, NotHeldError, ModifyConflictError,
+            RevisionConflictError, HoldersExistError, CopyFinalizedError) as exc:
+        extra = {}
+        if isinstance(exc, GroupHeldError):
+            extra = {"holder": exc.holder, "group": exc.group}
+        elif isinstance(exc, ModifyConflictError):
+            extra = {"foreign": exc.foreign}
+        elif isinstance(exc, RevisionConflictError):
+            extra = {"expected": exc.expected, "current": exc.current}
+        elif isinstance(exc, HoldersExistError):
+            extra = {"holders": exc.holders}
+        raise HTTPException(status_code=409,
+                            detail={"message": str(exc), **extra})
     except AnnotationNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except CopyNotFound as exc:
@@ -494,6 +507,14 @@ def create_copy(req: CopyRequest):
 @app.get("/api/copies/{copy_id}")
 def read_copy(copy_id: str):
     return _copy_snapshot(lambda: get_store().get(copy_id))
+
+
+@app.post("/api/copies/{copy_id}/finalize")
+def finalize_copy(copy_id: str, req: CopyFinalizeIn):
+    # 结稿为不可再改的定稿：乐观锁版本过期 / 仍有持有者 / 已结稿均 409，
+    # 与领取、释放、修改共用仓库进程锁串行化（等价于某个先后次序）。
+    return _copy_snapshot(
+        lambda: get_store().finalize(copy_id, req.expected_revision))
 
 
 # 批注 id 允许任意唯一字符串（含空串、"/" 与换行）：ann_id 使用能匹配

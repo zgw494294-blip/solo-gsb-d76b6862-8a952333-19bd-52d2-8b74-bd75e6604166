@@ -1,16 +1,20 @@
-"""可领取审阅工作副本：纯内存核心测试（分组 / 领取 / 释放 / 修改）。"""
+"""可领取审阅工作副本：纯内存核心测试（分组 / 领取 / 释放 / 修改 / 结稿）。"""
 
 import pytest
 
 from app.copies import (
     AnnotationNotFound,
+    CopyFinalizedError,
     CopyState,
     CopyValidationError,
     GroupHeldError,
+    HoldersExistError,
     ModifyConflictError,
     NotHeldError,
-    connected_groups,
+    RevisionConflictError,
     check_interval,
+    check_revision,
+    connected_groups,
 )
 
 TEXT = "x" * 20
@@ -245,3 +249,109 @@ def test_check_interval_helper():
     for bad in ((0, 0, 5), (-1, 2, 5), (3, 6, 5), (4, 3, 5)):
         with pytest.raises(CopyValidationError):
             check_interval(*bad)
+
+
+# ---------- 结稿（finalize） ----------
+
+def test_check_revision_helper():
+    check_revision(1)
+    check_revision(10 ** 9)
+    for bad in (0, -1, True, False, None, "1", 1.0, [], {}):
+        with pytest.raises(CopyValidationError):
+            check_revision(bad)
+
+
+def test_initial_status_is_open():
+    snap = state([ann("a", 0, 3)]).snapshot()
+    assert snap["status"] == "open"
+
+
+def test_finalize_unheld_succeeds_bumps_only_status_and_revision():
+    s = state([ann("a", 0, 4), ann("b", 3, 7), ann("c", 15, 18)])
+    before = s.snapshot()
+    s.finalize(1)
+    snap = s.snapshot()
+    assert snap["status"] == "finalized"
+    assert snap["revision"] == 2
+    # 文本、批注内容、持有权与排序均不变
+    assert snap["text"] == before["text"]
+    assert [(a["id"], a["start"], a["end"], a["label"], a["holder"])
+            for a in snap["annotations"]] == \
+        [(a["id"], a["start"], a["end"], a["label"], a["holder"])
+         for a in before["annotations"]]
+    assert snap["groups"] == before["groups"]
+
+
+def test_finalize_stale_revision_conflicts_and_changes_nothing():
+    s = state([ann("a", 0, 3)])
+    with pytest.raises(RevisionConflictError) as exc:
+        s.finalize(2)  # 当前 revision=1
+    assert exc.value.expected == 2 and exc.value.current == 1
+    snap = s.snapshot()
+    assert snap["status"] == "open" and snap["revision"] == 1
+
+
+def test_finalize_with_holders_conflicts_and_changes_nothing():
+    s = state([ann("a", 0, 4), ann("b", 3, 7), ann("c", 15, 18)])
+    s.claim("c", "bob")  # c 独立成组被持有，revision 1→2
+    with pytest.raises(HoldersExistError) as exc:
+        s.finalize(2)
+    assert exc.value.holders == ["bob"]
+    # 版本过期先于持有者检查
+    with pytest.raises(RevisionConflictError):
+        s.finalize(1)
+    snap = s.snapshot()
+    assert snap["status"] == "open" and snap["revision"] == 2  # 仅领取增过版本
+    assert holders_of(snap) == {"a": None, "b": None, "c": "bob"}
+
+
+def test_finalize_already_finalized_conflicts():
+    s = state([ann("a", 0, 3)])
+    s.finalize(1)
+    with pytest.raises(CopyFinalizedError):
+        s.finalize(2)  # 即使版本正确，已结稿仍 409；不提供重开
+    assert s.snapshot()["revision"] == 2
+
+
+def test_finalize_bad_revision_is_validation_error_before_other_checks():
+    s = state([ann("a", 0, 3)])
+    for bad in (0, -1, True, False, None, "1", 1.0):
+        with pytest.raises(CopyValidationError):
+            s.finalize(bad)
+    assert s.snapshot()["status"] == "open"
+    # 已结稿后非法版本号仍是 422（非法输入优先）
+    s.finalize(1)
+    with pytest.raises(CopyValidationError):
+        s.finalize(0)
+
+
+def test_claim_release_modify_after_finalized_all_conflict_but_404_422_kept():
+    s = state([ann("a", 0, 3), ann("b", 5, 8)])
+    s.finalize(1)
+    # 有效领取 / 释放 / 修改请求 → 409
+    with pytest.raises(CopyFinalizedError):
+        s.claim("a", "alice")
+    with pytest.raises(CopyFinalizedError):
+        s.release("a", "alice")
+    with pytest.raises(CopyFinalizedError):
+        s.modify("a", "alice", 0, 1, "X")
+    # 404 含义保留：批注不存在仍报 AnnotationNotFound（不是结稿错误）
+    with pytest.raises(AnnotationNotFound):
+        s.claim("nope", "alice")
+    # 422 含义保留：非法 reviewer / 区间仍报校验错误（优先于结稿门禁）
+    with pytest.raises(CopyValidationError):
+        s.claim("a", "")
+    with pytest.raises(CopyValidationError):
+        s.modify("a", "alice", 0, 0, "X")
+    snap = s.snapshot()
+    assert snap["revision"] == 2 and snap["status"] == "finalized"
+    assert holders_of(snap) == {"a": None, "b": None}
+
+
+def test_finalized_idempotent_claim_still_conflicts():
+    # 未结稿时本人重复领取幂等；结稿后一律 409（无幂等例外）
+    s = state([ann("a", 0, 3)])
+    s.finalize(1)
+    with pytest.raises(CopyFinalizedError):
+        s.claim("a", "alice")
+    assert s.snapshot()["revision"] == 2

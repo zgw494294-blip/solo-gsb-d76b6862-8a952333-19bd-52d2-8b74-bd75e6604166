@@ -245,6 +245,164 @@ def test_modify_unknown_annotation_404(client):
     assert r.status_code == 404
 
 
+# ---------- 结稿（POST /api/copies/{id}/finalize） ----------
+
+def _finalize(client, cid, rev):
+    return client.post(f"/api/copies/{cid}/finalize",
+                       json={"expected_revision": rev})
+
+
+def test_finalize_success_returns_full_snapshot(client):
+    cid = _create(client, anns=[ann("a", 0, 4), ann("b", 3, 7),
+                                ann("c", 15, 18)])
+    r = _finalize(client, cid, 1)
+    assert r.status_code == 200, r.text
+    snap = r.json()
+    assert snap["id"] == cid
+    assert snap["status"] == "finalized"
+    assert snap["revision"] == 2
+    assert snap["text"] == "x" * 30
+    # 文本、批注、持有权与排序不变
+    assert [(a["id"], a["start"], a["end"], a["label"], a["holder"])
+            for a in snap["annotations"]] == \
+        [("a", 0, 4, "L", None), ("b", 3, 7, "L", None),
+         ("c", 15, 18, "L", None)]
+    assert snap["groups"] == [
+        {"annotation_ids": ["a", "b"], "holder": None},
+        {"annotation_ids": ["c"], "holder": None},
+    ]
+
+
+def test_create_and_read_snapshot_carry_status(client):
+    cid = _create(client, anns=[ann("a", 0, 3)])
+    r = client.get(f"/api/copies/{cid}")
+    assert r.json()["status"] == "open"
+    _finalize(client, cid, 1)
+    assert client.get(f"/api/copies/{cid}").json()["status"] == "finalized"
+
+
+def test_finalize_with_holder_409_and_unchanged(client):
+    cid = _create(client, anns=[ann("a", 0, 4), ann("b", 3, 7)])
+    client.post(f"/api/copies/{cid}/annotations/a/claim",
+                json={"reviewer": "alice"})  # revision=2
+    r = _finalize(client, cid, 2)
+    assert r.status_code == 409
+    assert r.json()["detail"]["holders"] == ["alice"]
+    snap = client.get(f"/api/copies/{cid}").json()
+    assert snap["status"] == "open" and snap["revision"] == 2
+    assert {a["id"]: a["holder"] for a in snap["annotations"]} == \
+        {"a": "alice", "b": "alice"}
+
+
+def test_finalize_after_release_succeeds(client):
+    cid = _create(client, anns=[ann("a", 0, 3)])
+    client.post(f"/api/copies/{cid}/annotations/a/claim",
+                json={"reviewer": "alice"})
+    client.post(f"/api/copies/{cid}/annotations/a/release",
+                json={"reviewer": "alice"})  # revision=3
+    r = _finalize(client, cid, 3)
+    assert r.status_code == 200
+    assert r.json()["status"] == "finalized"
+    assert r.json()["revision"] == 4
+
+
+def test_finalize_stale_revision_409_and_unchanged(client):
+    cid = _create(client, anns=[ann("a", 0, 3)])
+    client.post(f"/api/copies/{cid}/annotations/a/claim",
+                json={"reviewer": "alice"})  # revision=2
+    r = _finalize(client, cid, 1)
+    assert r.status_code == 409
+    assert r.json()["detail"]["expected"] == 1
+    assert r.json()["detail"]["current"] == 2
+    snap = client.get(f"/api/copies/{cid}").json()
+    assert snap["status"] == "open" and snap["revision"] == 2
+    # 用最新版本仍可结稿（前一次失败未破坏任何状态）
+    client.post(f"/api/copies/{cid}/annotations/a/release",
+                json={"reviewer": "alice"})  # revision=3
+    assert _finalize(client, cid, 3).status_code == 200
+
+
+def test_finalize_already_finalized_409(client):
+    cid = _create(client, anns=[ann("a", 0, 3)])
+    assert _finalize(client, cid, 1).status_code == 200
+    # 版本正确也不能重开 / 再结稿
+    r = _finalize(client, cid, 2)
+    assert r.status_code == 409
+    assert client.get(f"/api/copies/{cid}").json()["revision"] == 2
+
+
+def test_finalize_bad_expected_revision_422(client):
+    cid = _create(client, anns=[ann("a", 0, 3)])
+    for body in ({"expected_revision": True}, {"expected_revision": False},
+                 {"expected_revision": 0}, {"expected_revision": -7},
+                 {"expected_revision": None}, {"expected_revision": 1.5},
+                 {}):
+        r = client.post(f"/api/copies/{cid}/finalize", json=body)
+        assert r.status_code == 422, body
+    # 数字字符串按 pydantic 整数强转接受（与 start/end 一致）；布尔拒绝
+    r = client.post(f"/api/copies/{cid}/finalize",
+                    json={"expected_revision": "1"})
+    assert r.status_code == 200, r.text
+    assert client.get(f"/api/copies/{cid}").json()["status"] == "finalized"
+
+
+def test_finalize_unknown_copy_404(client):
+    r = client.post("/api/copies/deadbeef/finalize",
+                    json={"expected_revision": 1})
+    assert r.status_code == 404
+    # 与现有接口一致：请求体在进路由前先经 pydantic 校验，body 非法时 422
+    # 优先于资源 404（同 claim 的非法 reviewer 对未知副本也是 422）
+    r = client.post("/api/copies/deadbeef/finalize",
+                    json={"expected_revision": 0})
+    assert r.status_code == 422
+
+
+def test_changes_after_finalized_all_409_but_404_422_kept(client):
+    cid = _create(client, anns=[ann("a", 0, 4), ann("b", 3, 7)])
+    assert _finalize(client, cid, 1).status_code == 200
+    # 有效的领取 / 释放 / 修改请求 → 409
+    assert client.post(f"/api/copies/{cid}/annotations/a/claim",
+                       json={"reviewer": "alice"}).status_code == 409
+    assert client.post(f"/api/copies/{cid}/annotations/b/release",
+                       json={"reviewer": "alice"}).status_code == 409
+    assert client.patch(f"/api/copies/{cid}/annotations/a",
+                        json={"reviewer": "alice", "start": 0, "end": 1,
+                              "label": "X"}).status_code == 409
+    # 原 404 含义保留：副本 / 批注不存在
+    assert client.post("/api/copies/deadbeef/annotations/a/claim",
+                       json={"reviewer": "alice"}).status_code == 404
+    assert client.post(f"/api/copies/{cid}/annotations/nope/claim",
+                       json={"reviewer": "alice"}).status_code == 404
+    # 原 422 含义保留：非法 reviewer / 区间
+    assert client.post(f"/api/copies/{cid}/annotations/a/claim",
+                       json={"reviewer": ""}).status_code == 422
+    assert client.patch(f"/api/copies/{cid}/annotations/a",
+                        json={"reviewer": "alice", "start": 0, "end": 0,
+                              "label": "X"}).status_code == 422
+    # 全部失败后快照无任何变化
+    snap = client.get(f"/api/copies/{cid}").json()
+    assert snap["status"] == "finalized" and snap["revision"] == 2
+    assert all(a["holder"] is None for a in snap["annotations"])
+    assert [(a["start"], a["end"], a["label"])
+            for a in snap["annotations"]] == [(0, 4, "L"), (3, 7, "L")]
+
+
+def test_finalized_snapshot_usable_in_review_api(client):
+    text = "目标是统一口径，验收时复核样本。"
+    cid = _create(client, text=text,
+                  anns=[ann("a1", 0, 4, "目标"), ann("a2", 13, 15, "对象")])
+    _finalize(client, cid, 1)
+    snap = client.get(f"/api/copies/{cid}").json()
+    r = client.post("/api/review/preview", json={
+        "text": snap["text"],
+        "max_chars": 10,
+        "context_chars": 2,
+        "annotations": [{"id": a["id"], "start": a["start"], "end": a["end"],
+                         "label": a["label"]} for a in snap["annotations"]],
+    })
+    assert r.status_code == 200
+
+
 # ---------- 副本批注可直接用于原审阅接口 ----------
 
 def test_copy_annotations_usable_in_review_api(client):
