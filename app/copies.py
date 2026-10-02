@@ -18,10 +18,18 @@ label），初始**无人持有**。
   在新几何上重算分组：新并入的未领取批注归该持有者；新组触及其他持有者的
   批注 → `ModifyConflictError`（409，范围与持有权均不变）；拆开的组保留原
   持有者。
+- **结稿**：携带 `expected_revision`（正整数）把副本从 `open` 结稿为
+  `finalized`——不可再改的定稿，不提供重开。已结稿 → `CopyFinalizedError`、
+  版本过期 → `RevisionMismatchError`、仍有持有者 → `CopyStillHeldError`
+  （均 409，失败不改任何状态）。成功仅把 `status` 改为 `finalized` 并
+  `revision += 1`，文本、批注、持有权与排序不变。结稿后领取 / 释放 / 修改
+  一律 `CopyFinalizedError`（409）；结稿与其他变更在锁内串行，等价于某个
+  先后次序，不会出现结稿成功后仍写入修改或领取的情况。
 
 `CopyState` 为不依赖数据库的纯内存核心（便于单测）；`CopyStore` 用 SQLite
 持久化，每个变更操作在进程级锁内「完整读入 → 纯核心运算 → 整体写回」，
-因此并发请求等价于逐次完整执行，不会丢失其他批注的修改。
+因此并发请求等价于逐次完整执行，不会丢失其他批注的修改。旧库启动时自动
+补 `status` 列，旧副本默认 `open` 且原 `revision` 不变。
 """
 
 from __future__ import annotations
@@ -74,6 +82,36 @@ class ModifyConflictError(CopyError):
             + "、".join(f"{i}（{h}）" for i, h in self.foreign.items()))
 
 
+class CopyFinalizedError(CopyError):
+    """工作副本已结稿，不可再变更（对应 HTTP 409）。"""
+
+    def __init__(self, copy_id: str):
+        self.copy_id = copy_id
+        super().__init__(f"工作副本已结稿，不可再变更：{copy_id}")
+
+
+class RevisionMismatchError(CopyError):
+    """expected_revision 与当前版本不一致，版本已过期（对应 HTTP 409）。"""
+
+    def __init__(self, expected: int, current: int):
+        self.expected = expected
+        self.current = current
+        super().__init__(
+            f"版本已过期：expected_revision={expected}，"
+            f"当前 revision={current}")
+
+
+class CopyStillHeldError(CopyError):
+    """副本仍有批注被持有，不能结稿（对应 HTTP 409）。"""
+
+    def __init__(self, holders: dict[str, str]):
+        # holders: {仍被持有的批注 id: 持有者}
+        self.holders = dict(holders)
+        super().__init__(
+            "副本仍有批注被持有，不能结稿："
+            + "、".join(f"{i}（{h}）" for i, h in self.holders.items()))
+
+
 class CopyNotFound(LookupError):
     """工作副本不存在（对应 HTTP 404）。"""
 
@@ -113,6 +151,13 @@ def check_interval(start, end, text_len: int) -> None:
         raise CopyValidationError(
             f"区间 [{start}, {end}) 非法或超出文本长度 {text_len}"
             "（须满足 0 ≤ start < end ≤ 文本长度）")
+
+
+def check_expected_revision(value) -> None:
+    """expected_revision 必须是正整数（布尔不是合法版本号）。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise CopyValidationError(
+            f"expected_revision 必须是正整数：{value!r}")
 
 
 # ---------- 分组（并查集） ----------
@@ -166,7 +211,8 @@ class CopyState:
     """单个工作副本的内存状态（持有不变量见模块 docstring）。"""
 
     def __init__(self, copy_id: str, text: str,
-                 annotations: list[dict], revision: int = 1):
+                 annotations: list[dict], revision: int = 1,
+                 status: str = "open"):
         self.copy_id = copy_id
         self.text = text
         self.order: list[str] = [a["id"] for a in annotations]
@@ -177,6 +223,12 @@ class CopyState:
         }
         self.holders: dict[str, str] = {}
         self.revision = revision
+        self.status = status  # "open" | "finalized"（结稿后不可再变更）
+
+    def _check_open(self) -> None:
+        """已结稿的副本不可再变更：领取 / 释放 / 修改 / 再次结稿均 409。"""
+        if self.status == "finalized":
+            raise CopyFinalizedError(self.copy_id)
 
     def _all_annotations(self) -> list[dict]:
         return [self.annotations[i] for i in self.order]
@@ -194,6 +246,7 @@ class CopyState:
         """领取批注所在整组。返回是否发生了状态变更（本人重复领取为 False）。"""
         check_reviewer(reviewer)
         group = self.group_of(ann_id)
+        self._check_open()  # 422 / 404 之后：结稿副本上的有效领取一律 409
         owners = {self.holders[i] for i in group if self.holders.get(i) is not None}
         other = next(iter(owners - {reviewer}), None)
         if other is not None:
@@ -209,6 +262,7 @@ class CopyState:
         """释放批注所在整组（仅限持有者本人）。"""
         check_reviewer(reviewer)
         group = self.group_of(ann_id)
+        self._check_open()
         owner = self.holders.get(group[0])  # 持有不变量：整组持有者相同
         if owner is None:
             raise NotHeldError(group)
@@ -226,6 +280,7 @@ class CopyState:
         if ann_id not in self.annotations:
             raise AnnotationNotFound(ann_id)
         check_interval(start, end, len(self.text))  # 非法输入优先于持有冲突
+        self._check_open()  # 422 / 404 之后：结稿副本上的有效修改一律 409
         if self.holders.get(ann_id) != reviewer:
             raise NotHeldError(
                 message=f"批注 {ann_id} 未由审阅者 {reviewer!r} 持有，不能修改")
@@ -250,6 +305,24 @@ class CopyState:
             self.holders[i] = reviewer
         self.revision += 1
 
+    def finalize(self, expected_revision: int) -> None:
+        """结稿为不可再改的定稿（不提供重开）。
+
+        仅当副本未结稿、``expected_revision`` 与当前版本一致且无任何持有者
+        时成功：仅把 ``status`` 从 ``open`` 改为 ``finalized`` 并
+        ``revision += 1``，文本、批注、持有权与排序均不变；任一条件不满足
+        抛错（409），状态完全不变。
+        """
+        check_expected_revision(expected_revision)
+        self._check_open()
+        if expected_revision != self.revision:
+            raise RevisionMismatchError(expected_revision, self.revision)
+        held = {i: h for i, h in self.holders.items() if h is not None}
+        if held:
+            raise CopyStillHeldError(held)
+        self.status = "finalized"
+        self.revision += 1
+
     def snapshot(self) -> dict:
         """返回同一提交状态下的文本、批注（含持有者）与连通组。"""
         anns = self._all_annotations()
@@ -258,6 +331,7 @@ class CopyState:
             "id": self.copy_id,
             "text": self.text,
             "revision": self.revision,
+            "status": self.status,
             "annotations": [
                 {"id": a["id"], "start": a["start"], "end": a["end"],
                  "label": a["label"], "holder": self.holders.get(a["id"])}
@@ -277,7 +351,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS copies (
     id         TEXT PRIMARY KEY,
     text       TEXT NOT NULL,
-    revision   INTEGER NOT NULL DEFAULT 1
+    revision   INTEGER NOT NULL DEFAULT 1,
+    status     TEXT NOT NULL DEFAULT 'open'
 );
 CREATE TABLE IF NOT EXISTS annotations (
     copy_id TEXT NOT NULL REFERENCES copies(id) ON DELETE CASCADE,
@@ -334,30 +409,40 @@ class CopyStore:
         return conn
 
     def init_schema(self) -> None:
-        """建表（幂等）：随容器启动初始化，重启后数据保留。"""
+        """建表（幂等）：随容器启动初始化，重启后数据保留。
+
+        旧库缺少 ``status`` 列时自动补列：既有副本默认 ``open``，
+        原 ``revision`` 不变。
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._connect()
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.executescript(SCHEMA)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(copies)")}
+            if "status" not in cols:
+                conn.execute(
+                    "ALTER TABLE copies "
+                    "ADD COLUMN status TEXT NOT NULL DEFAULT 'open'")
             conn.commit()
         finally:
             conn.close()
 
     def _load(self, conn: sqlite3.Connection, copy_id: str) -> CopyState:
         row = conn.execute(
-            "SELECT text, revision FROM copies WHERE id=?", (copy_id,)).fetchone()
+            "SELECT text, revision, status FROM copies WHERE id=?",
+            (copy_id,)).fetchone()
         if row is None:
             raise CopyNotFound(copy_id)
-        text, revision = row
+        text, revision, status = row
         rows = conn.execute(
             "SELECT ann_id, pos, start, end, label, holder FROM annotations "
             "WHERE copy_id=? ORDER BY pos", (copy_id,)).fetchall()
         state = CopyState(
             copy_id, text,
             [{"id": r[0], "start": r[2], "end": r[3], "label": r[4]} for r in rows],
-            revision=revision)
+            revision=revision, status=status)
         for r in rows:
             if r[5] is not None:
                 state.holders[r[0]] = r[5]
@@ -403,8 +488,8 @@ class CopyStore:
                 changed = operation(state)  # 抛错则直接跳出，不写库
                 if changed is not False:     # 幂等领取（False）不产生新版本
                     conn.execute(
-                        "UPDATE copies SET revision=? WHERE id=?",
-                        (state.revision, copy_id))
+                        "UPDATE copies SET revision=?, status=? WHERE id=?",
+                        (state.revision, state.status, copy_id))
                     # 整体写回该副本全部批注：持锁读入的最新状态上做的修改
                     # 不会覆盖其他批注（其他请求的修改已在本操作之前提交）。
                     conn.executemany(
@@ -434,3 +519,8 @@ class CopyStore:
         return self._apply(
             copy_id,
             lambda st: st.modify(ann_id, reviewer, start, end, label))
+
+    def finalize(self, copy_id: str, expected_revision: int) -> dict:
+        """结稿：与领取 / 释放 / 修改在同一进程锁内串行，等价于某个先后次序。"""
+        return self._apply(
+            copy_id, lambda st: st.finalize(expected_revision))

@@ -15,12 +15,15 @@ from starlette.convertors import Convertor, register_url_convertor
 from app.arbitration import ArbitrationError, apply_arbitration, build_groups
 from app.copies import (
     AnnotationNotFound,
+    CopyFinalizedError,
     CopyNotFound,
+    CopyStillHeldError,
     CopyStore,
     CopyValidationError,
     GroupHeldError,
     ModifyConflictError,
     NotHeldError,
+    RevisionMismatchError,
 )
 from app.migration import DecisionError, apply_decisions, migrate_annotations
 from app.nesting import NestingError, audit_nesting, export_nesting, validate_rules
@@ -206,6 +209,8 @@ def _nonempty_str(v):
 # 在 pydantic 强转前校验：bool 会被默认当作 int，需先行拒绝
 StrictInt = Annotated[int, BeforeValidator(_reject_bool)]
 NonEmptyStr = Annotated[str, BeforeValidator(_nonempty_str)]
+# 结稿用的期望版本号：正整数（布尔不是合法版本号）
+PositiveInt = Annotated[int, BeforeValidator(_reject_bool), Field(gt=0)]
 
 
 class CopyAnnotationIn(BaseModel):
@@ -231,6 +236,11 @@ class CopyModifyIn(BaseModel):
     start: StrictInt
     end: StrictInt
     label: NonEmptyStr
+
+
+class CopyFinalizeIn(BaseModel):
+    # 乐观并发：期望版本号必须是正整数（布尔不是合法版本号）
+    expected_revision: PositiveInt
 
 
 @app.get("/")
@@ -466,18 +476,24 @@ def get_store() -> CopyStore:
 
 
 def _copy_snapshot(action):
-    """统一映射工作副本错误：422 非法输入 / 409 持有冲突 / 404 资源不存在。"""
+    """统一映射工作副本错误：422 非法输入 / 409 持有冲突与结稿冲突 / 404 资源不存在。"""
     try:
         return action()
     except CopyValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    except (GroupHeldError, NotHeldError, ModifyConflictError) as exc:
+    except (GroupHeldError, NotHeldError, ModifyConflictError,
+            CopyFinalizedError, RevisionMismatchError,
+            CopyStillHeldError) as exc:
         raise HTTPException(status_code=409, detail={
             "message": str(exc),
             **({"holder": exc.holder, "group": exc.group}
                if isinstance(exc, GroupHeldError) else {}),
             **({"foreign": exc.foreign} if isinstance(exc, ModifyConflictError)
                else {}),
+            **({"expected_revision": exc.expected, "revision": exc.current}
+               if isinstance(exc, RevisionMismatchError) else {}),
+            **({"holders": exc.holders}
+               if isinstance(exc, CopyStillHeldError) else {}),
         })
     except AnnotationNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc))
@@ -536,6 +552,12 @@ def modify_copy_annotation(copy_id: str, ann_id: str, req: CopyModifyIn):
     return _copy_snapshot(
         lambda: get_store().modify(copy_id, ann_id, req.reviewer,
                                    req.start, req.end, req.label))
+
+
+@app.post("/api/copies/{copy_id}/finalize")
+def finalize_copy(copy_id: str, req: CopyFinalizeIn):
+    return _copy_snapshot(
+        lambda: get_store().finalize(copy_id, req.expected_revision))
 
 
 def _validate_rules(rules: RulesIn) -> dict:

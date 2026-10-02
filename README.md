@@ -179,8 +179,10 @@
 
 为现有审阅流程提供**可领取的工作副本**（纯 HTTP，无前端页面）：创建副本时
 提交**固定文本**与一组批注（每条含**唯一字符串** `id`、`start`、`end`、**非空**
-`label`，码点区间左闭右开 **[start, end)**），副本初始**无人持有**，持久化到
-随容器启动初始化的 **SQLite**（Compose 挂卷，重启后副本保留）。
+`label`，码点区间左闭右开 **[start, end)**），副本初始**无人持有**、
+`status` 为 `open`，持久化到随容器启动初始化的 **SQLite**（Compose 挂卷，
+重启后副本保留）。审阅完成后可**结稿**：`status` 从 `open` 变为 `finalized`
+的副本是**不可再改的定稿**，不提供重开。
 
 - **任意唯一字符串 id**：批注 `id` 接受**任意唯一字符串**，包括**空字符串**
   `""` 与含 `/`、`%`、`?`、`#`、**换行 `\n`** 等字符的字符串（如 `审阅/1`、
@@ -208,23 +210,36 @@
   不满足、重复 `id`、空 `reviewer` 等）返回 **422**；任何失败（422 / 409 / 404）
   **都不改变副本**。注意**空字符串 `id` 是合法的唯一字符串**（不是非法输入），
   通过相邻两个斜杠的 URL 定位（见上）。
-- **并发**：所有变更请求在服务端串行化，等价于**逐次完整执行**，不会丢失其他
-  批注的修改；每次成功变更 `revision` 加 1。
-- **读取**：`GET` 返回**同一提交状态**下的固定文本、全部批注（含 `holder`，未持有
-  为 `null`）、按稳定顺序排列的连通组（每组附 `holder`）与 `revision`。读取到的
-  批注可**直接用于原审阅接口**（如 `/api/review/preview`）。
+- **结稿**：`POST /api/copies/{id}/finalize`，入参 `expected_revision`（**正整数**，
+  **布尔值不是合法版本号**，非法返回 **422**）。仅当副本未结稿、
+  `expected_revision` 与当前 `revision` 一致且**无任何持有者**时成功：
+  仅把 `status` 从 `open` 改为 `finalized` 并 `revision += 1`，返回该次提交的
+  完整快照（文本、批注、持有权与排序均不变）。**版本过期**、**仍有持有者**或
+  **已结稿**均返回 **409**（失败不改任何状态）；未知副本 **404**。
+  结稿后**有效的领取 / 释放 / 修改请求一律返回 409**（原 404 / 422 含义保留），
+  且**不提供重开**。
+- **并发**：所有变更请求（含结稿）在服务端串行化，等价于**逐次完整执行**，
+  不会丢失其他批注的修改；结稿与领取 / 释放 / 修改并发时等价于某个先后次序，
+  不会出现结稿成功后仍写入修改或领取的情况；每次成功变更 `revision` 加 1。
+- **读取**：`GET` 返回**同一提交状态**下的固定文本、`status`（`open` /
+  `finalized`）、全部批注（含 `holder`，未持有为 `null`）、按稳定顺序排列的
+  连通组（每组附 `holder`）与 `revision`。读取到的批注可**直接用于原审阅接口**
+  （如 `/api/review/preview`）。
 
 SQLite 数据库在容器内位于 `/data/copies.db`（`docker-compose.yml` 的命名卷
-`copies-data`，随容器启动自动建表，重启保留副本）；可用环境变量 `COPY_DB_PATH`
-覆盖路径，本地开发默认回退到仓库根目录 `data/copies.db`（已在 `.gitignore`）。
+`copies-data`，随容器启动自动建表，重启保留副本与结稿状态）；可用环境变量
+`COPY_DB_PATH` 覆盖路径，本地开发默认回退到仓库根目录 `data/copies.db`（已在
+`.gitignore`）。**旧库启动时自动补 `status` 列**：既有副本默认 `open`，
+原 `revision` 不变。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/copies` | 入参 `{text, annotations:[{id,start,end,label}]}`（`id` 为唯一字符串），创建副本，返回 **201** 与初始快照（无人持有，`revision=1`）；非法输入 **422** |
-| GET | `/api/copies/{id}` | 返回 `{id, text, revision, annotations:[{id,start,end,label,holder}], groups:[{annotation_ids,holder}]}`；未知副本 **404** |
-| POST | `/api/copies/{id}/annotations/{ann_id}/claim` | 入参 `{reviewer}`，按批注 id **整组领取**，返回最新快照；他人持有 **409**，`reviewer` 非法 **422**，批注 / 副本不存在 **404**。`ann_id` 为任意唯一字符串，路径段须**百分号编码**（`审阅/1` → `%E5%AE%A1%E9%98%85%2F1`，`a\n` → `a%0A`，空串 → 相邻两个斜杠，见上文） |
-| POST | `/api/copies/{id}/annotations/{ann_id}/release` | 入参 `{reviewer}`，**持有者整组释放**；无人持有 / 他人持有 **409**，`reviewer` 非法 **422**；`ann_id` 编码规则同 claim |
-| PATCH | `/api/copies/{id}/annotations/{ann_id}` | 入参 `{reviewer, start, end, label}`，仅持有者改单条范围与 label，随后重算分组；触及他人 **409**（范围与持有权均不变），未持有 / 非法区间 / 空 label **409 / 422**。空串 id 的 URL 为 `.../annotations/`（以斜杠结尾）；`/`、字面 `%2F`、换行 `\n` 分别写作 `%2F`、`%252F`、`%0A` |
+| POST | `/api/copies` | 入参 `{text, annotations:[{id,start,end,label}]}`（`id` 为唯一字符串），创建副本，返回 **201** 与初始快照（无人持有，`status=open`，`revision=1`）；非法输入 **422** |
+| GET | `/api/copies/{id}` | 返回 `{id, text, revision, status, annotations:[{id,start,end,label,holder}], groups:[{annotation_ids,holder}]}`；未知副本 **404** |
+| POST | `/api/copies/{id}/annotations/{ann_id}/claim` | 入参 `{reviewer}`，按批注 id **整组领取**，返回最新快照；他人持有 **409**，`reviewer` 非法 **422**，批注 / 副本不存在 **404**，已结稿 **409**。`ann_id` 为任意唯一字符串，路径段须**百分号编码**（`审阅/1` → `%E5%AE%A1%E9%98%85%2F1`，`a\n` → `a%0A`，空串 → 相邻两个斜杠，见上文） |
+| POST | `/api/copies/{id}/annotations/{ann_id}/release` | 入参 `{reviewer}`，**持有者整组释放**；无人持有 / 他人持有 / 已结稿 **409**，`reviewer` 非法 **422**；`ann_id` 编码规则同 claim |
+| PATCH | `/api/copies/{id}/annotations/{ann_id}` | 入参 `{reviewer, start, end, label}`，仅持有者改单条范围与 label，随后重算分组；触及他人 **409**（范围与持有权均不变），未持有 / 已结稿 **409**，非法区间 / 空 label **422**。空串 id 的 URL 为 `.../annotations/`（以斜杠结尾）；`/`、字面 `%2F`、换行 `\n` 分别写作 `%2F`、`%252F`、`%0A` |
+| POST | `/api/copies/{id}/finalize` | 入参 `{expected_revision}`（正整数，布尔 **422**），版本一致且无持有者时结稿为 `finalized`（`revision += 1`，其余不变），返回该次提交完整快照；版本过期 / 仍有持有者 / 已结稿 **409**，未知副本 **404**；结稿后领取 / 释放 / 修改均 **409**，不提供重开 |
 
 ```bash
 # 创建工作副本：a 与 b 正长度重叠同组；b 与 c 相接不连边；d 独立
@@ -259,6 +274,34 @@ curl -s -X PATCH http://localhost:8000/api/copies/$CID/annotations/c \
 
 # 读取同一提交状态（含 holder 与连通组），可直接喂给原审阅接口
 curl -s http://localhost:8000/api/copies/$CID
+
+# 读取当前版本与持有情况：revision=5、status=open，c 仍由 bob 持有
+curl -s http://localhost:8000/api/copies/$CID \
+  | python3 -c 'import json,sys; s=json.load(sys.stdin);
+                print(s["revision"], s["status"],
+                      {a["id"]: a["holder"] for a in s["annotations"]})'
+
+# 仍有持有者时结稿 → 409 {"detail":{"message":...,"holders":{"c":"bob"}}}
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  http://localhost:8000/api/copies/$CID/finalize \
+  -H 'Content-Type: application/json' -d '{"expected_revision":5}'   # 409
+
+# bob 释放后结稿：版本一致且无持有者 → status 变为 finalized、revision 加 1，
+# 返回该次提交的完整快照（文本、批注、持有权与排序不变）
+curl -s -o /dev/null -X POST http://localhost:8000/api/copies/$CID/annotations/c/release \
+  -H 'Content-Type: application/json' -d '{"reviewer":"bob"}'
+curl -s -X POST http://localhost:8000/api/copies/$CID/finalize \
+  -H 'Content-Type: application/json' -d '{"expected_revision":6}'
+# → {"id":...,"revision":7,"status":"finalized",...}
+
+# 结稿后修改 / 领取 / 释放一律 409；版本过期或重复结稿同样 409（不提供重开）
+curl -s -o /dev/null -w '%{http_code}\n' -X PATCH \
+  http://localhost:8000/api/copies/$CID/annotations/c \
+  -H 'Content-Type: application/json' \
+  -d '{"reviewer":"bob","start":8,"end":10,"label":"丙再改"}'        # 409
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  http://localhost:8000/api/copies/$CID/finalize \
+  -H 'Content-Type: application/json' -d '{"expected_revision":7}'   # 409（已结稿）
 ```
 
 ### 特殊批注 id（空串、含 `/`、字面 `%2F` 与换行）的可执行调用
@@ -701,11 +744,12 @@ JSON」得到：
 | POST | `/api/relabel/preview` | 入参 `{text, annotations:[{id,start,end,label,…}], rules:{target_labels:[…], rules:[{from,to,pattern?}]}}`，返回 `{items:[{id,start,end,text,source_label,final_label,chain,steps,status,errors}], errors, target_labels}`——逐条迁移链（含命中规则）与逐项错误（`no_rule` / `cycle`）；非法区间 / 空 label / 重复 id / 规则集非法（空或重复目标标签、空 from/to、非法正则、回退规则冲突）均返回 **422** |
 | POST | `/api/relabel/export` | 同上；后端重新求值迁移链，存在逐项错误时返回 **409** 并列出 `errors`，否则返回 `{annotations, count}`——保持输入顺序与 id、范围、其余字段不变，只替换 label |
 | POST | `/api/redact/export` | 入参 `{text, annotations:[{id,start,end,label}], redact_labels:[…]}`；命中标签的区间重叠或相接即合并，每区替换为一个 `[遮盖]`，命中批注不导出，其余批注跨区拆成可见片段（完全被遮盖的舍弃），返回 `{text, annotations:[{source_id,fragment,start,end,label}], count, redacted_count}`——片段按原批注顺序及原文位置排列，`fragment` 从 1 开始，范围内文字为原文可见部分；无命中时文本与批注范围不变；非法区间 / 空 label / 重复 id / 非法遮盖标签均返回 **422**（不返回部分结果） |
-| POST | `/api/copies` | 可领取审阅工作副本：入参 `{text, annotations:[{id,start,end,label}]}`（唯一字符串 id、非空 label、码点 `[start,end)`），返回 **201** 与初始快照（无人持有、`revision=1`，持久化到 SQLite 挂卷）；非法输入 **422** |
-| GET | `/api/copies/{id}` | 返回同一提交状态 `{id, text, revision, annotations:[{id,start,end,label,holder}], groups:[{annotation_ids,holder}]}`（正长度重叠传递连通、相接不连边）；未知副本 **404** |
-| POST | `/api/copies/{id}/annotations/{ann_id}/claim` | 入参 `{reviewer}`（非空字符串），按批注 id 整组领取（本人重复领取幂等）；他人持有 **409**，非法 reviewer **422**，副本 / 批注不存在 **404**。`ann_id` 为任意唯一字符串（**含空串、含 `/` 与含换行 `\n` 的 id**），路径段按标准百分号编码：`审阅/1` → `%E5%AE%A1%E9%98%85%2F1`、字面 `%2F` → `%252F`、`a\n` → `a%0A`、空串 → 相邻两个斜杠 |
-| POST | `/api/copies/{id}/annotations/{ann_id}/release` | 入参 `{reviewer}`，持有者本人整组释放；无人持有 / 他人持有 **409**，非法 reviewer **422**；`ann_id` 编码规则同 claim |
-| PATCH | `/api/copies/{id}/annotations/{ann_id}` | 入参 `{reviewer,start,end,label}`，仅持有者改单条范围与 label（不增删批注）后重算分组：并入的未领取批注归本人，触及他人 **409**（范围与持有权均不变），拆开的组保留原持有者；未持有 **409**，非法区间 / 空 label / 非法 reviewer **422**；并发请求等价逐次完整执行。空串 id 的 URL 以斜杠结尾（`.../annotations/`），服务端只解码一次且完整保留解码后的每个字符，故 `/`（`%2F`）与字面 `%2F`（`%252F`）、`a` 与 `a\n`（`a%0A`）均不混同 |
+| POST | `/api/copies` | 可领取审阅工作副本：入参 `{text, annotations:[{id,start,end,label}]}`（唯一字符串 id、非空 label、码点 `[start,end)`），返回 **201** 与初始快照（无人持有、`status=open`、`revision=1`，持久化到 SQLite 挂卷）；非法输入 **422** |
+| GET | `/api/copies/{id}` | 返回同一提交状态 `{id, text, revision, status, annotations:[{id,start,end,label,holder}], groups:[{annotation_ids,holder}]}`（正长度重叠传递连通、相接不连边）；未知副本 **404** |
+| POST | `/api/copies/{id}/annotations/{ann_id}/claim` | 入参 `{reviewer}`（非空字符串），按批注 id 整组领取（本人重复领取幂等）；他人持有 / 【409】，非法 reviewer **422**，副本 / 批注不存在 **404**，已结稿 **409**。`ann_id` 为任意唯一字符串（**含空串、含 `/` 与含换行 `\n` 的 id**），路径段按标准百分号编码：`审阅/1` → `%E5%AE%A1%E9%98%85%2F1`、字面 `%2F` → `%252F`、`a\n` → `a%0A`、空串 → 相邻两个斜杠 |
+| POST | `/api/copies/{id}/annotations/{ann_id}/release` | 入参 `{reviewer}`，持有者本人整组释放；无人持有 / 他人持有 / 已结稿 **409**，非法 reviewer **422**；`ann_id` 编码规则同 claim |
+| PATCH | `/api/copies/{id}/annotations/{ann_id}` | 入参 `{reviewer,start,end,label}`，仅持有者改单条范围与 label（不增删批注）后重算分组：并入的未领取批注归本人，触及他人 **409**（范围与持有权均不变），拆开的组保留原持有者；未持有 / 已结稿 **409**，非法区间 / 空 label / 非法 reviewer **422**；并发请求等价逐次完整执行。空串 id 的 URL 以斜杠结尾（`.../annotations/`），服务端只解码一次且完整保留解码后的每个字符，故 `/`（`%2F`）与字面 `%2F`（`%252F`）、`a` 与 `a\n`（`a%0A`）均不混同 |
+| POST | `/api/copies/{id}/finalize` | 入参 `{expected_revision}`（正整数，布尔 / 非正数 **422**），把副本结稿为不可再改的定稿：仅 `status` 由 `open` 变 `finalized`、`revision += 1`，返回该次提交完整快照（文本、批注、持有权与排序不变）；版本过期 / 仍有持有者 / 已结稿 **409**（失败不改任何状态），未知副本 **404**；结稿后有效的领取 / 释放 / 修改均 **409**，不提供重开；结稿与其他变更并发等价于某个先后次序 |
 
 迁移导出条目状态取值：`shifted` / `matched` / `disambiguated` / `manual` / `abandoned`（废弃项 `start`、`end` 为 `null`）。
 
@@ -882,7 +926,7 @@ app/
   review.py          # 审阅切片核心：顺序装箱、窗口均分与边界余量转移、JSONL 导出、审阅结果校验回导
   relabel.py         # 标签体系迁移核心：规则集校验（目标标签 / 正则 / 回退约束）、迁移链求值（循环与缺规则检测）、导出重算
   redaction.py       # 遮盖导出核心：命中区间重叠/相接合并、[遮盖] 替换、可见片段拆分与新码点坐标换算
-  copies.py          # 可领取审阅工作副本：正长度重叠传递分组（相接不连边）、整组领取/释放、持有者改单条后重算分组，SQLite 持久化（进程锁串行化，重启保留）
+  copies.py          # 可领取审阅工作副本：正长度重叠传递分组（相接不连边）、整组领取/释放、持有者改单条后重算分组、乐观版本结稿（open→finalized，不可重开），SQLite 持久化（进程锁串行化，旧库自动补 status 列，重启保留）
   static/            # 原生 HTML/CSS/JS 前端（index.html 迁移页、arbitrate.html 仲裁页、sequence.html 序列标注页、nesting.html 嵌套审计页、units.html 制式转换页、review.html 审阅切片页、relabel.html 标签体系迁移页）
 tests/
   test_migration.py
@@ -896,6 +940,7 @@ tests/
   test_copies.py
   test_copy_store.py
   test_copy_api.py
+  test_copy_finalize.py      # 结稿：HTTP / 持久化 / 旧库迁移 / 并发先后次序
   test_copy_special_ids_http.py  # 空串 / 含"/" / 字面"%2F" / 含换行 特殊 id 的真实 HTTP（uvicorn）全流程回归
   test_validation.py
 Dockerfile
